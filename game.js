@@ -33,8 +33,11 @@ const randInt = (min, max) => Math.floor(rand(min, max + 1));
 
 const TRIPLE_DURATION = 10;    // segundos de disparo triple
 const TRIPLE_SPREAD = 0.2;   // rad entre balas del abanico
+const SHIELD_DURATION = 5;     // segundos de escudo (o hasta absorber un golpe)
+const SHIELD_RADIUS = 22;
 const POWERUP_MIN_KILLS = 3;  // asteroides destruidos antes de que pueda aparecer
 const POWERUP_MAX_KILLS = 10; // ...y límite para garantizar que aparezca en el nivel
+const POWERUP_LABELS = { triple: '3', shield: 'E' };
 
 // ── Bullet ────────────────────────────────────────────────────────────────────
 class Bullet
@@ -68,13 +71,14 @@ class Bullet
   }
 }
 
-// ── PowerUp (disparo triple) ──────────────────────────────────────────────────
+// ── PowerUp (disparo triple / escudo) ─────────────────────────────────────────
 class PowerUp
 {
-  constructor(x, y)
+  constructor(x, y, type)
   {
     this.x = x;
     this.y = y;
+    this.type = type;
     const angle = rand(0, Math.PI * 2);
     this.vx = Math.cos(angle) * 20;
     this.vy = Math.sin(angle) * 20;
@@ -104,7 +108,7 @@ class PowerUp
     ctx.font = 'bold 13px monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('3', this.x, this.y + 1);
+    ctx.fillText(POWERUP_LABELS[this.type], this.x, this.y + 1);
     ctx.textBaseline = 'alphabetic';
   }
 }
@@ -193,6 +197,7 @@ class Ship
     this.invincible = 3;
     this.shootCooldown = 0;
     this.tripleTimer = 0;
+    this.shieldTimer = 0;
     this.dead = false;
   }
 
@@ -202,6 +207,7 @@ class Ship
     if (this.invincible > 0) this.invincible -= dt;
     if (this.shootCooldown > 0) this.shootCooldown -= dt;
     if (this.tripleTimer > 0) this.tripleTimer -= dt;
+    if (this.shieldTimer > 0) this.shieldTimer -= dt;
 
     const ROT = 3.5;   // rad/s
     const THRUST = 260;  // px/s²
@@ -239,6 +245,17 @@ class Ship
   draw()
   {
     if (this.dead) return;
+
+    // Escudo: parpadea durante el último segundo y medio
+    if (this.shieldTimer > 0 && (this.shieldTimer > 1.5 || Math.floor(this.shieldTimer * 8) % 2))
+    {
+      ctx.strokeStyle = '#40e0d0';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, SHIELD_RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
     // Parpadeo durante invencibilidad de reaparición
     if (this.invincible > 0 && Math.floor(this.invincible * 8) % 2 === 0) return;
 
@@ -311,7 +328,7 @@ class Particle
 
 // ── Estado del juego ──────────────────────────────────────────────────────────
 let ship, bullets, asteroids, particles, powerUps;
-let powerUpCountdown; // asteroides por destruir hasta que aparezca el disparo triple (1 por nivel)
+let powerUpCountdowns; // por tipo: asteroides por destruir hasta que aparezca el power-up (1 de cada tipo por nivel)
 let score, lives, level;
 let state;      // 'playing' | 'dead' | 'gameover'
 let deadTimer;
@@ -331,14 +348,21 @@ function spawnAsteroids(count)
   }
 }
 
+function resetPowerUps()
+{
+  powerUps = [];
+  powerUpCountdowns = {};
+  for (const type in POWERUP_LABELS)
+    powerUpCountdowns[type] = randInt(POWERUP_MIN_KILLS, POWERUP_MAX_KILLS);
+}
+
 function initGame()
 {
   ship = new Ship();
   bullets = [];
   asteroids = [];
   particles = [];
-  powerUps = [];
-  powerUpCountdown = randInt(POWERUP_MIN_KILLS, POWERUP_MAX_KILLS);
+  resetPowerUps();
   score = 0;
   lives = 3;
   level = 1;
@@ -351,8 +375,7 @@ function nextLevel()
   level++;
   bullets = [];
   particles = [];
-  powerUps = [];
-  powerUpCountdown = randInt(POWERUP_MIN_KILLS, POWERUP_MAX_KILLS);
+  resetPowerUps();
   ship.reset();
   spawnAsteroids(3 + level);
 }
@@ -419,7 +442,8 @@ function update(dt)
     if (dist(ship, p) < ship.radius + p.radius)
     {
       p.dead = true;
-      ship.tripleTimer = TRIPLE_DURATION;
+      if (p.type === 'shield') ship.shieldTimer = SHIELD_DURATION;
+      else ship.tripleTimer = TRIPLE_DURATION;
     }
   }
   powerUps = powerUps.filter(p => !p.dead);
@@ -437,8 +461,9 @@ function update(dt)
         score += POINTS[a.size];
         explode(a.x, a.y, a.size * 5);
         newAsteroids.push(...a.split());
-        if (powerUpCountdown > 0 && --powerUpCountdown === 0)
-          powerUps.push(new PowerUp(a.x, a.y));
+        for (const type in powerUpCountdowns)
+          if (powerUpCountdowns[type] > 0 && --powerUpCountdowns[type] === 0)
+            powerUps.push(new PowerUp(a.x, a.y, type));
       }
     }
   }
@@ -452,7 +477,13 @@ function update(dt)
     {
       if (dist(ship, a) < ship.radius + a.radius * 0.82)
       {
-        killShip();
+        if (ship.shieldTimer > 0)
+        {
+          // El escudo absorbe el golpe; breve invulnerabilidad para no recibir otro al instante
+          ship.shieldTimer = 0;
+          ship.invincible = 1;
+          explode(ship.x, ship.y, 8);
+        } else killShip();
         break;
       }
     }
@@ -495,19 +526,28 @@ function drawHUD()
   for (let i = 0; i < lives; i++)
     drawLifeIcon(W - 16 - i * 22, 18);
 
+  // Indicadores centrados bajo el nivel, apilados: texto + barra que se vacía
+  let y = 48;
   if (ship.tripleTimer > 0)
   {
-    // Indicador centrado bajo el nivel: texto + barra que se vacía
-    const BAR_W = 120;
-    ctx.textAlign = 'center';
-    ctx.fillText(`DISPARO TRIPLE  ${Math.ceil(ship.tripleTimer)}s`, W / 2, 48);
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(W / 2 - BAR_W / 2, 56, BAR_W, 6);
-    ctx.fillStyle = '#40e0d0';
-    ctx.fillRect(W / 2 - BAR_W / 2, 56, BAR_W * (ship.tripleTimer / TRIPLE_DURATION), 6);
+    drawTimerBar('DISPARO TRIPLE', ship.tripleTimer, TRIPLE_DURATION, y);
+    y += 34;
   }
+  if (ship.shieldTimer > 0)
+    drawTimerBar('ESCUDO', ship.shieldTimer, SHIELD_DURATION, y);
+}
 
+function drawTimerBar(label, timer, max, y)
+{
+  const BAR_W = 120;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${label}  ${Math.ceil(timer)}s`, W / 2, y);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(W / 2 - BAR_W / 2, y + 8, BAR_W, 6);
+  ctx.fillStyle = '#40e0d0';
+  ctx.fillRect(W / 2 - BAR_W / 2, y + 8, BAR_W * (timer / max), 6);
 }
 
 function drawOverlay(title, sub)
